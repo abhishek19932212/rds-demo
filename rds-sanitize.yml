@@ -1,0 +1,1068 @@
+Conditions:
+  KmsEmpty:
+    Fn::Equals:
+      - Ref: KMS
+      - ''
+Description: Sanitize and copy latest RDS snapshot to a different account
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Database
+        Parameters:
+          - Db
+          - NewSnapshot
+      - Label:
+          default: Options
+        Parameters:
+          - Schedule
+          - SanitizeSQL
+          - ShareAccounts
+          - SnapshotFormat
+          - KMS
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - SubnetIds
+    ParameterLabels:
+      Db:
+        default: Source database identifier
+      KMS:
+        default: KMS key id to re-encrypt snapshots (leave empty to not encrypt)
+      NewSnapshot:
+        default: Use existing snapshot or create new one
+      SanitizeSQL:
+        default: Sanitization SQL statements
+      Schedule:
+        default: Snapshot schedule
+      ShareAccounts:
+        default: List of AWS accounts to share snapshot with (leave empty to not share)
+      SnapshotFormat:
+        default: Snapshot name format using Python .format() function
+      SubnetIds:
+        default: Subnets for temporary database (at least two)
+      VpcId:
+        default: VPC for temporary database
+Parameters:
+  Db:
+    Type: String
+  KMS:
+    Default: ''
+    Type: String
+  NewSnapshot:
+    AllowedValues:
+      - Take new snapshot
+      - Use latest existing snapshot
+    Default: Use latest existing snapshot
+    Type: String
+  SanitizeSQL:
+    Type: String
+  Schedule:
+    Default: rate(7 days)
+    Type: String
+  ShareAccounts:
+    Default: ''
+    Type: List<String>
+  SnapshotFormat:
+    Default: '{database_identifier:.42}-sanitized-{date:%Y-%m-%d}'
+    Type: String
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+Resources:
+  CloudWatchRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: states:StartExecution
+                Effect: Allow
+                Resource:
+                  Ref: SnapshotSanitizeAndCopy
+            Version: '2012-10-17'
+          PolicyName: StepFunction
+    Type: AWS::IAM::Role
+  FargateCluster:
+    Type: AWS::ECS::Cluster
+  FargateServiceRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+    Type: AWS::IAM::Role
+  HandlerFunction:
+    Properties:
+      Code:
+        ZipFile: "Y='available'\nX='DBSnapshots'\nW='kms'\nV='temp_snapshot_id2'\n\
+          U='temp_snapshot_id'\nT='RDS-sanitized-snapshots-temp'\nQ=True\nP='target_snapshot_id'\n\
+          O='DBInstances'\nN='Key'\nM=print\nL=ValueError\nF='temp_db_id'\nD='db_identifier'\n\
+          C='snapshot_id'\nimport datetime as R,re,secrets as E,boto3 as H\nB=H.client('rds')\n\
+          S=H.client('resourcegroupstaggingapi')\nI={}\nclass NotReady(Exception):0\n\
+          def G(uid=None):\n\tB='Value';A=[{N:'RDS-sanitized-snapshots',B:'yes'}]\n\
+          \tif uid:A.append({N:T,B:uid})\n\treturn A\ndef J(s):\n\tif'stop'in s or'delet'in\
+          \ s or'fail'in s or'incompatible'in s or'inaccessible'in s or'error'in s:raise\
+          \ L('Bad status `${s}`')\ndef A(name):\n\tdef A(f):I[name]=f;return f\n\t\
+          return A\n@A('Initialize')\ndef Z(state,uid):\n\tG='-';A=state;H=B.describe_db_instances(DBInstanceIdentifier=A[D])[O][0];A['engine']=H['Engine'];A[U]=A[D][:55]+G+E.token_hex(5);A[V]=A[D][:55]+G+E.token_hex(5);A[F]=A[D][:55]+G+E.token_hex(5);A[P]=A[D][:55]+G+E.token_hex(5);C=A[P]=A['snapshot_format'].format(database_identifier=A[D],date=R.datetime.now())\n\
+          \tif not re.match('[a-z][a-z0-9\\\\-]{1,62}',C,re.I)or'--'in C or C[-1]==G:raise\
+          \ L(f\"Invalid snapshot id generated from format - {C}\")\n\tif A[W]and\
+          \ H['DBInstanceClass']in['db.m1.small','db.m1.medium','db.m1.large','db.m1.xlarge','db.m2.xlarge','db.m2.2xlarge','db.m2.4xlarge','db.t2.micro']:raise\
+          \ L(\"Instance type doesn't support encryption.\")\n@A('FindLatestSnapshot')\n\
+          def a(state,uid):\n\tE=state;G=E[D];A=[]\n\tfor H in B.get_paginator('describe_db_snapshots').paginate(DBInstanceIdentifier=G):\n\
+          \t\tfor F in H[X]:A.append((F['SnapshotCreateTime'],F))\n\tA.sort();E[C]=A[-1][1]['DBSnapshotIdentifier']\n\
+          @A('TakeSnapshot')\ndef b(state,uid):A=state;A[C]=A[U];B.create_db_snapshot(DBInstanceIdentifier=A[D],DBSnapshotIdentifier=A[C],Tags=G(uid))\n\
+          @A('TakeFinalSnapshot')\ndef c(state,uid):A=state;A[C]=A[P];B.create_db_snapshot(DBInstanceIdentifier=A[F],DBSnapshotIdentifier=A[C],Tags=G())\n\
+          @A('WaitForSnapshot')\n@A('WaitForFinalSnapshot')\n@A('WaitForEncrypt')\n\
+          def d(state,uid):\n\tD=B.describe_db_snapshots(DBSnapshotIdentifier=state[C])[X][0];A=D['Status']\n\
+          \tif A==Y:return\n\tJ(A);raise NotReady()\n@A('Encrypt')\ndef e(state,uid):A=state;D=A[C];A[C]=A[V];B.copy_db_snapshot(SourceDBSnapshotIdentifier=D,TargetDBSnapshotIdentifier=A[C],KmsKeyId=A[W],Tags=G(uid))\n\
+          @A('CreateTempDatabase')\ndef f(state,uid):D=False;A=state;B.restore_db_instance_from_db_snapshot(DBInstanceIdentifier=A[F],DBSnapshotIdentifier=A[C],PubliclyAccessible=D,AutoMinorVersionUpgrade=D,VpcSecurityGroupIds=[A['security_group_id']],DBSubnetGroupName=A['subnet_group_id'],Tags=G(uid))\n\
+          @A('WaitForTempDatabase')\n@A('WaitForPassword')\ndef g(state,uid):\n\t\
+          A=B.describe_db_instances(DBInstanceIdentifier=state[F])[O][0];C=A['DBInstanceStatus']\n\
+          \tif C==Y and not A['PendingModifiedValues']:return\n\tJ(C);raise NotReady()\n\
+          @A('SetTempPassword')\ndef h(state,uid):H='Endpoint';G='password';D='db';A=state;C=B.describe_db_instances(DBInstanceIdentifier=A[F])[O][0];A[D]={'host':C[H]['Address'],'port':str(C[H]['Port']),'user':C['MasterUsername'],G:E.token_hex(32),'database':C.get('DBName','')};B.modify_db_instance(DBInstanceIdentifier=A[F],ApplyImmediately=Q,BackupRetentionPeriod=0,MasterUserPassword=A[D][G])\n\
+          @A('ShareSnapshot')\ndef i(state,uid):\n\tD='shared_accounts';A=state\n\t\
+          if A[D]:B.modify_db_snapshot_attribute(DBSnapshotIdentifier=A[C],AttributeName='restore',ValuesToAdd=A[D])\n\
+          def K(t,i):return[A['ResourceARN'].split(':')[-1]for A in S.get_resources(ResourceTypeFilters=[t],TagFilters=[{N:T,'Values':[i]}])['ResourceTagMappingList']]\n\
+          @A('Cleanup')\n@A('ErrorCleanup')\ndef j(state,uid):\n\tfor A in K('rds:db',uid):M(f\"\
+          Deleting temporary database {A}\");B.delete_db_instance(DBInstanceIdentifier=A,SkipFinalSnapshot=Q,DeleteAutomatedBackups=Q)\n\
+          \tfor C in K('rds:snapshot',uid):M(f\"Deleting temporary snapshot {C}\"\
+          );B.delete_db_snapshot(DBSnapshotIdentifier=C)\ndef handler(event,context):A=event;M('event:',A);C=A['state_name'];B=A['state'];I[C](B,A['uid']);return\
+          \ B"
+      Handler: index.handler
+      Role:
+        Fn::GetAtt:
+          - HandlerRole
+          - Arn
+      Runtime: python3.7
+      Timeout: 30
+    Type: AWS::Lambda::Function
+  HandlerRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - Fn::If:
+                      - KmsEmpty
+                      - Ref: AWS::NoValue
+                      - rds:CopyDBSnapshot
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBSnapshots
+                  - rds:CreateDBSnapshot
+                Effect: Allow
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:${Db}
+                  - Fn::Sub: arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:snapshot:*
+                Sid: OriginalDB
+              - Action: rds:RestoreDBInstanceFromDBSnapshot
+                Condition:
+                  StringEquals:
+                    rds:req-tag/RDS-sanitized-snapshots: 'yes'
+                Effect: Allow
+                Resource: '*'
+                Sid: Snapshot
+              - Action:
+                  - rds:CreateDBInstance
+                  - rds:DeleteDBInstance
+                  - rds:DescribeDBInstances
+                  - rds:ModifyDBInstance
+                  - rds:CreateDBSnapshot
+                  - rds:DeleteDBSnapshot
+                  - rds:ModifyDBSnapshotAttribute
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - RDS-sanitized-snapshots
+                Effect: Allow
+                Resource: '*'
+                Sid: TempDB
+              - Action: tag:GetResources
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - RDS-sanitized-snapshots-temp
+                Effect: Allow
+                Resource: '*'
+                Sid: Cleanup
+              - Fn::If:
+                  - KmsEmpty
+                  - Ref: AWS::NoValue
+                  - Action:
+                      - kms:CreateGrant
+                      - kms:DescribeKey
+                    Effect: Allow
+                    Resource:
+                      Ref: KMS
+                    Sid: Copy
+            Version: '2012-10-17'
+          PolicyName: RDS
+    Type: AWS::IAM::Role
+  MariadbSanitizerTask:
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - mysql
+            - -e
+            - Ref: SanitizeSQL
+          Image: mariadb
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Ref: SanitizerLogs
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-stream-prefix: sql
+          Name: sql
+      Cpu: '512'
+      ExecutionRoleArn:
+        Fn::GetAtt:
+          - FargateServiceRole
+          - Arn
+      Memory: 1GB
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+    Type: AWS::ECS::TaskDefinition
+  MysqlSanitizerTask:
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - mysql
+            - -e
+            - Ref: SanitizeSQL
+          Image: mysql
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Ref: SanitizerLogs
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-stream-prefix: sql
+          Name: sql
+      Cpu: '512'
+      ExecutionRoleArn:
+        Fn::GetAtt:
+          - FargateServiceRole
+          - Arn
+      Memory: 1GB
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+    Type: AWS::ECS::TaskDefinition
+  PostgresSanitizerTask:
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - psql
+            - -c
+            - Ref: SanitizeSQL
+          Image: postgres
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Ref: SanitizerLogs
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-stream-prefix: sql
+          Name: sql
+      Cpu: '512'
+      ExecutionRoleArn:
+        Fn::GetAtt:
+          - FargateServiceRole
+          - Arn
+      Memory: 1GB
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+    Type: AWS::ECS::TaskDefinition
+  SanitizerLogs:
+    Type: AWS::Logs::LogGroup
+  ScheduleRule:
+    Properties:
+      Description: RDS-sanitized-snapshots schedule
+      ScheduleExpression:
+        Ref: Schedule
+      Targets:
+        - Arn:
+            Ref: SnapshotSanitizeAndCopy
+          Id: SnapshotAndSanitize
+          RoleArn:
+            Fn::GetAtt:
+              - CloudWatchRole
+              - Arn
+    Type: AWS::Events::Rule
+  SecurityGroup:
+    Properties:
+      GroupDescription: Group for communication between sanitizing job and database
+      Tags:
+        - Key: Name
+          Value: RDS-sanitized-snapshots
+      VpcId:
+        Ref: VpcId
+    Type: AWS::EC2::SecurityGroup
+  SecurityGroupRule:
+    Properties:
+      FromPort: 0
+      GroupId:
+        Ref: SecurityGroup
+      IpProtocol: tcp
+      SourceSecurityGroupId:
+        Ref: SecurityGroup
+      ToPort: 65535
+    Type: AWS::EC2::SecurityGroupIngress
+  SnapshotSanitizeAndCopy:
+    Properties:
+      DefinitionString:
+        Fn::Sub:
+          - |-
+            {
+              "StartAt": "Initialize",
+              "States": {
+                "Success": {
+                  "Type": "Succeed"
+                },
+                "Failure": {
+                  "Type": "Fail"
+                },
+                "Initialize": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "Initialize",
+                    "state": {
+                      "db_identifier": "${Db}",
+                      "vpc_id": "${VpcId}",
+                      "subnet_group_id": "${SubnetGroup}",
+                      "security_group_id": "${SecurityGroup}",
+                      "new_snapshot": "${NewSnapshot}",
+                      "shared_accounts": [
+                        "${ShareAccountsJoined}"
+                      ],
+                      "snapshot_format": "${SnapshotFormat}",
+                      "kms": "${KMS}"
+                    }
+                  },
+                  "Next": "ChooseSnapshot",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "ChooseSnapshot": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.new_snapshot",
+                      "StringEquals": "Take new snapshot",
+                      "Next": "TakeSnapshot"
+                    },
+                    {
+                      "Variable": "$.new_snapshot",
+                      "StringEquals": "Use latest existing snapshot",
+                      "Next": "FindLatestSnapshot"
+                    }
+                  ],
+                  "Default": "ErrorCleanup"
+                },
+                "TakeSnapshot": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "TakeSnapshot",
+                    "state.$": "$"
+                  },
+                  "Next": "WaitForSnapshot",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "WaitForSnapshot": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "WaitForSnapshot",
+                    "state.$": "$"
+                  },
+                  "Next": "ShouldEncrypt",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ],
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "NotReady"
+                      ],
+                      "IntervalSeconds": 60,
+                      "MaxAttempts": 300,
+                      "BackoffRate": 1
+                    }
+                  ]
+                },
+                "FindLatestSnapshot": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "FindLatestSnapshot",
+                    "state.$": "$"
+                  },
+                  "Next": "ShouldEncrypt",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "ShouldEncrypt": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.kms",
+                      "StringEquals": "",
+                      "Next": "CreateTempDatabase"
+                    }
+                  ],
+                  "Default": "Encrypt"
+                },
+                "Encrypt": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "Encrypt",
+                    "state.$": "$"
+                  },
+                  "Next": "WaitForEncrypt",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "WaitForEncrypt": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "WaitForEncrypt",
+                    "state.$": "$"
+                  },
+                  "Next": "CreateTempDatabase",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ],
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "NotReady"
+                      ],
+                      "IntervalSeconds": 60,
+                      "MaxAttempts": 300,
+                      "BackoffRate": 1
+                    }
+                  ]
+                },
+                "CreateTempDatabase": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "CreateTempDatabase",
+                    "state.$": "$"
+                  },
+                  "Next": "WaitForTempDatabase",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "WaitForTempDatabase": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "WaitForTempDatabase",
+                    "state.$": "$"
+                  },
+                  "Next": "SetTempPassword",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ],
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "NotReady"
+                      ],
+                      "IntervalSeconds": 60,
+                      "MaxAttempts": 300,
+                      "BackoffRate": 1
+                    }
+                  ]
+                },
+                "SetTempPassword": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "SetTempPassword",
+                    "state.$": "$"
+                  },
+                  "Next": "WaitForPassword",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "WaitForPassword": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "WaitForPassword",
+                    "state.$": "$"
+                  },
+                  "Next": "ChooseSanitizer",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ],
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "NotReady"
+                      ],
+                      "IntervalSeconds": 60,
+                      "MaxAttempts": 300,
+                      "BackoffRate": 1
+                    }
+                  ]
+                },
+                "ChooseSanitizer": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.engine",
+                      "StringEquals": "postgres",
+                      "Next": "SanitizePostgres"
+                    },
+                    {
+                      "Variable": "$.engine",
+                      "StringEquals": "mysql",
+                      "Next": "SanitizeMySQL"
+                    },
+                    {
+                      "Variable": "$.engine",
+                      "StringEquals": "mariadb",
+                      "Next": "SanitizeMariaDB"
+                    }
+                  ],
+                  "Default": "ErrorCleanup"
+                },
+                "SanitizePostgres": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::ecs:runTask.sync",
+                  "OutputPath": "$",
+                  "ResultPath": "$.SanitizeResult",
+                  "Parameters": {
+                    "TaskDefinition": "${PostgresSanitizerTask}",
+                    "Cluster": "${FargateCluster}",
+                    "LaunchType": "FARGATE",
+                    "NetworkConfiguration": {
+                      "AwsvpcConfiguration": {
+                        "AssignPublicIp": "ENABLED",
+                        "SecurityGroups": [
+                          "${SecurityGroup}"
+                        ],
+                        "Subnets": [
+                          "${SubnetIdsJoined}"
+                        ]
+                      }
+                    },
+                    "Overrides": {
+                      "ContainerOverrides": [
+                        {
+                          "Name": "sql",
+                          "Environment": [
+                            {
+                              "Name": "PGHOST",
+                              "Value.$": "$.db.host"
+                            },
+                            {
+                              "Name": "PGPORT",
+                              "Value.$": "$.db.port"
+                            },
+                            {
+                              "Name": "PGUSER",
+                              "Value.$": "$.db.user"
+                            },
+                            {
+                              "Name": "PGPASSWORD",
+                              "Value.$": "$.db.password"
+                            },
+                            {
+                              "Name": "PGDATABASE",
+                              "Value.$": "$.db.database"
+                            },
+                            {
+                              "Name": "PGCONNECT_TIMEOUT",
+                              "Value": "30"
+                            },
+                            {
+                              "Name": "MYSQL_HOST",
+                              "Value.$": "$.db.host"
+                            },
+                            {
+                              "Name": "MYSQL_PORT",
+                              "Value.$": "$.db.port"
+                            },
+                            {
+                              "Name": "MYSQL_USER",
+                              "Value.$": "$.db.user"
+                            },
+                            {
+                              "Name": "MYSQL_PASSWORD",
+                              "Value.$": "$.db.password"
+                            },
+                            {
+                              "Name": "MYSQL_DATABASE",
+                              "Value.$": "$.db.database"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "Next": "TakeFinalSnapshot",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "SanitizeMySQL": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::ecs:runTask.sync",
+                  "OutputPath": "$",
+                  "ResultPath": "$.SanitizeResult",
+                  "Parameters": {
+                    "TaskDefinition": "${MysqlSanitizerTask}",
+                    "Cluster": "${FargateCluster}",
+                    "LaunchType": "FARGATE",
+                    "NetworkConfiguration": {
+                      "AwsvpcConfiguration": {
+                        "AssignPublicIp": "ENABLED",
+                        "SecurityGroups": [
+                          "${SecurityGroup}"
+                        ],
+                        "Subnets": [
+                          "${SubnetIdsJoined}"
+                        ]
+                      }
+                    },
+                    "Overrides": {
+                      "ContainerOverrides": [
+                        {
+                          "Name": "sql",
+                          "Environment": [
+                            {
+                              "Name": "PGHOST",
+                              "Value.$": "$.db.host"
+                            },
+                            {
+                              "Name": "PGPORT",
+                              "Value.$": "$.db.port"
+                            },
+                            {
+                              "Name": "PGUSER",
+                              "Value.$": "$.db.user"
+                            },
+                            {
+                              "Name": "PGPASSWORD",
+                              "Value.$": "$.db.password"
+                            },
+                            {
+                              "Name": "PGDATABASE",
+                              "Value.$": "$.db.database"
+                            },
+                            {
+                              "Name": "PGCONNECT_TIMEOUT",
+                              "Value": "30"
+                            },
+                            {
+                              "Name": "MYSQL_HOST",
+                              "Value.$": "$.db.host"
+                            },
+                            {
+                              "Name": "MYSQL_PORT",
+                              "Value.$": "$.db.port"
+                            },
+                            {
+                              "Name": "MYSQL_USER",
+                              "Value.$": "$.db.user"
+                            },
+                            {
+                              "Name": "MYSQL_PASSWORD",
+                              "Value.$": "$.db.password"
+                            },
+                            {
+                              "Name": "MYSQL_DATABASE",
+                              "Value.$": "$.db.database"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "Next": "TakeFinalSnapshot",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "SanitizeMariaDB": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::ecs:runTask.sync",
+                  "OutputPath": "$",
+                  "ResultPath": "$.SanitizeResult",
+                  "Parameters": {
+                    "TaskDefinition": "${MariadbSanitizerTask}",
+                    "Cluster": "${FargateCluster}",
+                    "LaunchType": "FARGATE",
+                    "NetworkConfiguration": {
+                      "AwsvpcConfiguration": {
+                        "AssignPublicIp": "ENABLED",
+                        "SecurityGroups": [
+                          "${SecurityGroup}"
+                        ],
+                        "Subnets": [
+                          "${SubnetIdsJoined}"
+                        ]
+                      }
+                    },
+                    "Overrides": {
+                      "ContainerOverrides": [
+                        {
+                          "Name": "sql",
+                          "Environment": [
+                            {
+                              "Name": "PGHOST",
+                              "Value.$": "$.db.host"
+                            },
+                            {
+                              "Name": "PGPORT",
+                              "Value.$": "$.db.port"
+                            },
+                            {
+                              "Name": "PGUSER",
+                              "Value.$": "$.db.user"
+                            },
+                            {
+                              "Name": "PGPASSWORD",
+                              "Value.$": "$.db.password"
+                            },
+                            {
+                              "Name": "PGDATABASE",
+                              "Value.$": "$.db.database"
+                            },
+                            {
+                              "Name": "PGCONNECT_TIMEOUT",
+                              "Value": "30"
+                            },
+                            {
+                              "Name": "MYSQL_HOST",
+                              "Value.$": "$.db.host"
+                            },
+                            {
+                              "Name": "MYSQL_PORT",
+                              "Value.$": "$.db.port"
+                            },
+                            {
+                              "Name": "MYSQL_USER",
+                              "Value.$": "$.db.user"
+                            },
+                            {
+                              "Name": "MYSQL_PASSWORD",
+                              "Value.$": "$.db.password"
+                            },
+                            {
+                              "Name": "MYSQL_DATABASE",
+                              "Value.$": "$.db.database"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "Next": "TakeFinalSnapshot",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "TakeFinalSnapshot": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "TakeFinalSnapshot",
+                    "state.$": "$"
+                  },
+                  "Next": "WaitForFinalSnapshot",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "WaitForFinalSnapshot": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "WaitForFinalSnapshot",
+                    "state.$": "$"
+                  },
+                  "Next": "ShareSnapshot",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ],
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "NotReady"
+                      ],
+                      "IntervalSeconds": 60,
+                      "MaxAttempts": 300,
+                      "BackoffRate": 1
+                    }
+                  ]
+                },
+                "ShareSnapshot": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "ShareSnapshot",
+                    "state.$": "$"
+                  },
+                  "Next": "Cleanup",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "Next": "ErrorCleanup"
+                    }
+                  ]
+                },
+                "Cleanup": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "Cleanup",
+                    "state.$": "$"
+                  },
+                  "Next": "Success",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "IntervalSeconds": 120,
+                      "MaxAttempts": 10
+                    }
+                  ]
+                },
+                "ErrorCleanup": {
+                  "Type": "Task",
+                  "Resource": "${HandlerFunction.Arn}",
+                  "Parameters": {
+                    "uid.$": "$$.Execution.Id",
+                    "state_name": "ErrorCleanup",
+                    "state.$": "$"
+                  },
+                  "Next": "Failure",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "IntervalSeconds": 120,
+                      "MaxAttempts": 10
+                    }
+                  ]
+                }
+              }
+            }
+          - ShareAccountsJoined:
+              Fn::Join:
+                - '", "'
+                - Ref: ShareAccounts
+            SubnetIdsJoined:
+              Fn::Join:
+                - '", "'
+                - Ref: SubnetIds
+      RoleArn:
+        Fn::GetAtt:
+          - StateMachineRole
+          - Arn
+    Type: AWS::StepFunctions::StateMachine
+  StateMachineRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: lambda:InvokeFunction
+                Effect: Allow
+                Resource:
+                  Fn::GetAtt:
+                    - HandlerFunction
+                    - Arn
+            Version: '2012-10-17'
+          PolicyName: CallHandlers
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ecs:RunTask
+                Effect: Allow
+                Resource:
+                  - Ref: PostgresSanitizerTask
+                  - Ref: MysqlSanitizerTask
+                  - Ref: MariadbSanitizerTask
+              - Action:
+                  - ecs:StopTask
+                  - ecs:DescribeTasks
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Effect: Allow
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule
+              - Action: iam:PassRole
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - ecs-tasks.amazonaws.com
+                Effect: Allow
+                Resource:
+                  Fn::GetAtt:
+                    - FargateServiceRole
+                    - Arn
+            Version: '2012-10-17'
+          PolicyName: SyncFargate
+    Type: AWS::IAM::Role
+  SubnetGroup:
+    Properties:
+      DBSubnetGroupDescription: Temporary database used for RDS-sanitize-snapshots
+      SubnetIds:
+        Ref: SubnetIds
+    Type: AWS::RDS::DBSubnetGroup
